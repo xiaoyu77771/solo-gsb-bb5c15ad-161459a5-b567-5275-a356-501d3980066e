@@ -65,6 +65,25 @@ def get_release_status(release_id: str) -> dict:
     return service.get_release(release_id)
 
 
+@app.get("/api/releases/{release_id}/diff", tags=["releases"])
+def diff_release(
+    release_id: str,
+    base_release_id: str = Query(
+        ..., min_length=1,
+        description="基线批次 ID；比较方向为 base -> target（路径上的 release_id 为目标批次）",
+    ),
+) -> dict:
+    """比较两个批次实际持久化的裁剪后图（只读）。
+
+    返回 added / removed / changed；同名节点在节点类型、工期、重试配置、元数据或
+    前置依赖集合任一变化时命中 changed，并给出字段级 reasons（含两侧取值）。
+    impacted_nodes 从 added/changed 沿**目标批次**依赖边向下游传播（含起点）；
+    removed 单独报告，不向已不存在的节点映射。各列表按节点名稳定排序并给出计数。
+    任一缺失批次返回 404 release_not_found；接口不改变任何批次状态。
+    """
+    return service.diff_releases(release_id, base_release_id)
+
+
 @app.get("/api/releases/{release_id}/plan", tags=["releases"])
 def get_release_plan(
     release_id: str,

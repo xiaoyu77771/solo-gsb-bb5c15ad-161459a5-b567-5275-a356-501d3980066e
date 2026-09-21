@@ -466,6 +466,140 @@ def get_release(release_id: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# 批次结构差异与影响面（只读，比较实际持久化的裁剪后图）
+# --------------------------------------------------------------------------- #
+def _load_persisted_graph(conn, release_id: str) -> dict[str, Any]:
+    """读取批次实际持久化的图（targets 裁剪后的诱导子图）。
+
+    仅取结构 / 配置列，不取回报状态等运行时数据：差异比较不关心节点执行到了哪一步。
+    缺失批次沿用统一的 404 release_not_found。
+    """
+    r = dict(_get_release_row(conn, release_id))
+    node_rows = conn.execute(
+        """SELECT name, node_type, estimated_seconds, max_attempts,
+                  retry_delay_seconds, metadata_json
+           FROM nodes WHERE release_id = ?""",
+        (release_id,),
+    ).fetchall()
+    nodes: dict[str, dict[str, Any]] = {}
+    for n in node_rows:
+        nodes[n["name"]] = {
+            "node_type": n["node_type"],
+            "estimated_seconds": int(n["estimated_seconds"] or 0),
+            "max_attempts": int(n["max_attempts"] if n["max_attempts"] is not None else 1),
+            "retry_delay_seconds": int(n["retry_delay_seconds"] or 0),
+            "metadata": json.loads(n["metadata_json"]),
+        }
+    prereqs: dict[str, set[str]] = defaultdict(set)
+    succs: dict[str, set[str]] = defaultdict(set)
+    for e in conn.execute(
+        "SELECT from_node, to_node FROM edges WHERE release_id = ?", (release_id,)
+    ):
+        prereqs[e["to_node"]].add(e["from_node"])
+        succs[e["from_node"]].add(e["to_node"])
+    return {
+        "id": r["id"],
+        "version": r["version"],
+        "status": r["status"],
+        "targets": json.loads(r["targets_json"]) if r.get("targets_json") else None,
+        "excluded_node_count": int(r.get("excluded_node_count") or 0),
+        "nodes": nodes,
+        "prereqs": prereqs,
+        "succs": succs,
+    }
+
+
+# changed 字段级 reasons 的固定输出顺序（稳定、可读）
+_DIFF_FIELDS = ("node_type", "estimated_seconds", "max_attempts",
+                "retry_delay_seconds", "metadata", "dependencies")
+
+
+def diff_releases(release_id: str, base_release_id: str) -> dict[str, Any]:
+    """比较目标批次相对基线批次的结构差异（base -> target）。
+
+    - 两边都只取**实际持久化**的裁剪后图：传了 targets 而未被持久化的节点 / 边
+      在差异中完全不可见，可能表现为 added / removed。
+    - 同名节点在节点类型、工期、重试配置、元数据或前置依赖集合任一变化时计入
+      changed，并给出字段级 reasons（含 base / target 两侧取值）。
+    - impacted_nodes：从 added ∪ changed 出发，沿**目标批次**依赖边向下游
+      （from -> to 方向）传递闭包；包含起点本身。removed 不参与传播——
+      其下游在新图中可能已不存在，无法映射，故 removed 单独报告。
+    - 纯只读，不开事务、不写任何状态；各列表按节点名字典序排序。
+    """
+    with lock():
+        conn = get_conn()
+        target = _load_persisted_graph(conn, release_id)
+        base = _load_persisted_graph(conn, base_release_id)
+
+    base_nodes, target_nodes = base["nodes"], target["nodes"]
+    base_names, target_names = set(base_nodes), set(target_nodes)
+
+    added = sorted(target_names - base_names)
+    removed = sorted(base_names - target_names)
+
+    changed: list[dict[str, Any]] = []
+    for name in sorted(base_names & target_names):
+        bn, tn = base_nodes[name], target_nodes[name]
+        b_pre = sorted(base["prereqs"].get(name, set()))
+        t_pre = sorted(target["prereqs"].get(name, set()))
+        deltas = {
+            "node_type": bn["node_type"] != tn["node_type"],
+            "estimated_seconds": bn["estimated_seconds"] != tn["estimated_seconds"],
+            "max_attempts": bn["max_attempts"] != tn["max_attempts"],
+            "retry_delay_seconds":
+                bn["retry_delay_seconds"] != tn["retry_delay_seconds"],
+            "metadata": bn["metadata"] != tn["metadata"],
+            "dependencies": b_pre != t_pre,
+        }
+        reasons: list[dict[str, Any]] = []
+        values = {
+            "node_type": (bn["node_type"], tn["node_type"]),
+            "estimated_seconds": (bn["estimated_seconds"], tn["estimated_seconds"]),
+            "max_attempts": (bn["max_attempts"], tn["max_attempts"]),
+            "retry_delay_seconds":
+                (bn["retry_delay_seconds"], tn["retry_delay_seconds"]),
+            "metadata": (bn["metadata"], tn["metadata"]),
+            "dependencies": (b_pre, t_pre),
+        }
+        for field in _DIFF_FIELDS:
+            if deltas[field]:
+                old, new = values[field]
+                reasons.append({"field": field, "base": old, "target": new})
+        if reasons:
+            changed.append({"node": name, "reasons": reasons})
+
+    # 影响面：added/changed 作为起点沿目标批次的下游边传播（含起点）
+    seeds = set(added) | {c["node"] for c in changed}
+    impacted: set[str] = set(seeds)
+    stack = list(seeds)
+    while stack:
+        cur = stack.pop()
+        for nxt in target["succs"].get(cur, set()):
+            if nxt not in impacted:
+                impacted.add(nxt)
+                stack.append(nxt)
+    impacted_nodes = sorted(impacted)
+
+    return {
+        "base_release_id": base["id"],
+        "target_release_id": target["id"],
+        "base_version": base["version"],
+        "target_version": target["version"],
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "impacted_nodes": impacted_nodes,
+        "counts": {
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+            "impacted_nodes": len(impacted_nodes),
+        },
+        "compared_scope": "persisted_pruned_graph",
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 节点回报
 # --------------------------------------------------------------------------- #
 def _record_event(conn, release_id: str, node: str, event_type: str,

@@ -703,4 +703,141 @@ with TestClient(app) as legacy_client:
     assert r.json()["release"]["status"] == "failed"
 print("[OK] 旧批次 max_attempts 默认 1：首次失败即终态回滚，详情返回全部重试字段")
 
+# --- 22. 发布批次结构差异与影响面：GET /api/releases/{id}/diff ---
+# 切回主测试库（第 21 步把连接切到了 legacy.db）
+config.DB_PATH = os.environ["DB_PATH"]
+database.init_db(os.environ["DB_PATH"])
+
+# 基线批次：a,b -> c -> d；e 独立
+r = client.post("/api/releases", json={
+    "version": "v-diff-base",
+    "nodes": [
+        {"name": "a", "node_type": "service", "estimated_seconds": 2,
+         "max_attempts": 1, "retry_delay_seconds": 0, "metadata": {"team": "infra"}},
+        {"name": "b"}, {"name": "c"}, {"name": "d"}, {"name": "e"},
+    ],
+    "dependencies": [
+        {"from_node": "a", "to_node": "c"},
+        {"from_node": "b", "to_node": "c"},
+        {"from_node": "c", "to_node": "d"},
+    ],
+})
+dbid = r.json()["id"]
+
+# 目标批次：a 四个标量字段 + 元数据变化；c 前置集合变化（b 移除、n1 新增）；
+# d 新增前置 n2；b/e 被移除；n1/n2 新增；d 自身不变但在 c 的下游
+r = client.post("/api/releases", json={
+    "version": "v-diff-target",
+    "nodes": [
+        {"name": "a", "node_type": "job", "estimated_seconds": 5,
+         "max_attempts": 3, "retry_delay_seconds": 30,
+         "metadata": {"team": "infra", "region": "cn"}},
+        {"name": "c"}, {"name": "d"}, {"name": "n1"}, {"name": "n2"},
+    ],
+    "dependencies": [
+        {"from_node": "a", "to_node": "c"},
+        {"from_node": "n1", "to_node": "c"},
+        {"from_node": "c", "to_node": "d"},
+        {"from_node": "n2", "to_node": "d"},
+    ],
+})
+dtid = r.json()["id"]
+
+d = client.get(f"/api/releases/{dtid}/diff?base_release_id={dbid}").json()
+assert d["base_release_id"] == dbid and d["target_release_id"] == dtid
+assert d["base_version"] == "v-diff-base" and d["target_version"] == "v-diff-target"
+assert d["added"] == ["n1", "n2"]
+assert d["removed"] == ["b", "e"]
+changed_map = {c_["node"]: c_["reasons"] for c_ in d["changed"]}
+assert sorted(changed_map) == ["a", "c", "d"]
+assert [x["field"] for x in changed_map["a"]] == [
+    "node_type", "estimated_seconds", "max_attempts",
+    "retry_delay_seconds", "metadata",
+]
+type_reason = next(x for x in changed_map["a"] if x["field"] == "node_type")
+assert type_reason["base"] == "service" and type_reason["target"] == "job"
+dep_reason = next(x for x in changed_map["c"] if x["field"] == "dependencies")
+assert dep_reason["base"] == ["a", "b"] and dep_reason["target"] == ["a", "n1"]
+dep_reason_d = next(x for x in changed_map["d"] if x["field"] == "dependencies")
+assert dep_reason_d["base"] == ["c"] and dep_reason_d["target"] == ["c", "n2"]
+# 影响面：seeds = added{n1,n2} ∪ changed{a,c,d}；沿目标图下游传播（含起点）
+# a -> c -> d；n1 -> c -> d；n2 -> d；并集 {a,c,d,n1,n2}（b/e 为 removed，不参与）
+assert d["impacted_nodes"] == ["a", "c", "d", "n1", "n2"], d["impacted_nodes"]
+assert d["counts"] == {"added": 2, "removed": 2, "changed": 3, "impacted_nodes": 5}
+print("[OK] diff：added/removed/changed 字段级 reasons、下游传递 impacted_nodes 与计数")
+
+# 仅比较实际持久化的裁剪后图：目标按 targets=['c'] 裁剪，d 虽在提交图中但未入库 -> removed
+r = client.post("/api/releases", json={
+    "version": "v-diff-pruned",
+    "nodes": [
+        {"name": "a", "node_type": "service", "estimated_seconds": 2,
+         "max_attempts": 1, "retry_delay_seconds": 0, "metadata": {"team": "infra"}},
+        {"name": "b"}, {"name": "c"}, {"name": "d"},
+    ],
+    "dependencies": [
+        {"from_node": "a", "to_node": "c"},
+        {"from_node": "b", "to_node": "c"},
+        {"from_node": "c", "to_node": "d"},
+    ],
+    "targets": ["c"],
+})
+dpid = r.json()["id"]
+d2 = client.get(f"/api/releases/{dpid}/diff?base_release_id={dbid}").json()
+assert d2["added"] == [] and d2["removed"] == ["d", "e"], d2
+assert d2["changed"] == [] and d2["impacted_nodes"] == []
+assert d2["counts"] == {"added": 0, "removed": 2, "changed": 0, "impacted_nodes": 0}
+print("[OK] diff 仅比较持久化的裁剪后图：未入库的 d 计为 removed，无 added/changed 时影响面为空")
+
+# 完全相同的两个批次（含 targets） -> 全部为空
+r = client.post("/api/releases", json={
+    "version": "v-diff-same",
+    "nodes": [
+        {"name": "a", "node_type": "service", "estimated_seconds": 2,
+         "metadata": {"team": "infra"}},
+        {"name": "b"}, {"name": "c"}, {"name": "d"}, {"name": "e"},
+    ],
+    "dependencies": [
+        {"from_node": "a", "to_node": "c"},
+        {"from_node": "b", "to_node": "c"},
+        {"from_node": "c", "to_node": "d"},
+    ],
+})
+sameid = r.json()["id"]
+d3 = client.get(f"/api/releases/{sameid}/diff?base_release_id={dbid}").json()
+assert d3["added"] == [] and d3["removed"] == [] and d3["changed"] == []
+assert d3["impacted_nodes"] == []
+# 自身与自身比较
+dself = client.get(f"/api/releases/{dbid}/diff?base_release_id={dbid}").json()
+assert dself["added"] == dself["removed"] == dself["changed"] == []
+assert dself["impacted_nodes"] == []
+print("[OK] 相同批次 / 自身比较：差异与影响面均为空")
+
+# removed 不映射到目标图中不存在的节点：基线 a->c->d，目标只有 a
+r = client.post("/api/releases", json={
+    "version": "v-diff-shrink",
+    "nodes": [
+        {"name": "a", "node_type": "service", "estimated_seconds": 2,
+         "max_attempts": 1, "retry_delay_seconds": 0, "metadata": {"team": "infra"}},
+    ],
+})
+shid = r.json()["id"]
+d4 = client.get(f"/api/releases/{shid}/diff?base_release_id={dbid}").json()
+assert d4["added"] == [] and d4["removed"] == ["b", "c", "d", "e"]
+assert d4["changed"] == [] and d4["impacted_nodes"] == []
+print("[OK] removed 单独报告且不参与影响面传播")
+
+# 只读：批次状态 / 节点状态在 diff 前后不变
+assert client.get(f"/api/releases/{dbid}").json()["status"] == "pending"
+assert client.get(f"/api/releases/{dtid}").json()["status"] == "pending"
+
+# 缺失批次沿用 404；缺少 query 参数 -> 422
+assert client.get("/api/releases/ghost/diff",
+                  params={"base_release_id": dbid}).status_code == 404
+r = client.get(f"/api/releases/{dtid}/diff?base_release_id=ghost")
+assert r.status_code == 404 and r.json()["error"]["code"] == "release_not_found"
+assert client.get(f"/api/releases/{dtid}/diff").status_code == 422
+assert client.get(f"/api/releases/{dtid}/diff",
+                  params={"base_release_id": " "}).status_code == 404  # 非空但不存在 -> 404
+print("[OK] diff 只读不改状态；缺失批次 404、缺少 base_release_id 422、空白值按不存在 404")
+
 print("\n全部测试通过 ✔")
