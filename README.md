@@ -89,6 +89,35 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 旧批次（创建时未提供工期 / 升级前的数据）缺省工期一律按 `0` 处理，CPM 仍可输出完整结果；
   服务启动时会自动为旧版 SQLite 文件补列（`ALTER TABLE` 迁移，幂等）。
 
+**批次结构差异与影响面（`GET /diff`，只读）**
+
+`GET /api/releases/{id}/diff?base_release_id=<基准批次ID>` 以路径批次为**目标批次**、
+查询参数批次为**基准批次**（方向 base → target），只比较两个批次**实际持久化的裁剪后图**：
+按 `targets` 裁剪掉的节点与边不参与比较（它们从未入库），运行时回报状态（`status`、
+`attempt_count`、事件等）同样不参与——比较的是纯结构定义。
+
+- `added`：仅存在于目标批次的节点名；`removed`：仅存在于基准批次的节点名（按名排序）。
+- `changed`：两批次同名节点在以下任一字段不同即命中，每项给出字段级 `reasons`：
+
+  | reason | 命中条件 |
+  | --- | --- |
+  | `node_type` | 节点类型变化（如 `service` → `job`） |
+  | `estimated_seconds` | 预估工期变化 |
+  | `max_attempts` | 最大尝试次数变化（重试配置） |
+  | `retry_delay_seconds` | 重试延迟变化（重试配置） |
+  | `metadata` | 附加元数据内容变化（按 JSON 语义比较） |
+  | `dependencies` | **前置依赖集合**变化（新增 / 移除任一持久化依赖边即命中） |
+
+  `reasons` 按上表固定顺序输出；`changed` 列表按节点名字典序排序。
+- `impacted_nodes`：从全部 `added` / `changed` 节点出发，沿**目标批次**的持久化依赖边
+  向**下游（后置方向）**传递可达的节点闭包（**含触发起点本身**；added/changed 节点互为下游
+  时会被同一闭包吸收），按名字排序。语义：目标批次中定义发生变化、或位于变化节点下游、
+  发布时需要重新关注 / 执行的节点。
+- `removed` 节点在目标批次图中已不存在，**不映射到任何下游节点**，单独在 `removed` 报告。
+- 四个列表均给出 `counts` 计数（`added` / `removed` / `changed` / `impacted_nodes`）。
+- 接口**只读**：不改变任何批次或节点状态；目标批次或基准批次不存在均返回
+  **`404 release_not_found`**；缺少 `base_release_id` 参数返回 422。
+
 **回报与并发控制**
 
 - 回报必须携带与批次一致的 `version`，否则返回 `409 version_mismatch`（拒绝跨版本回报）。
@@ -148,6 +177,7 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/releases?limit=50` | 发布批次列表 |
 | `GET` | `/api/releases/{id}` | 查询发布状态（节点状态含 `attempt_count` / `max_attempts` / `next_retry_at`、进度、next_nodes，未到期重试节点不出现） |
 | `GET` | `/api/releases/{id}/plan?deadline_seconds=` | 拓扑分层 + CPM 工期分析（最短工期、最早/最晚开始、total_slack、零余量关键节点、字典序最小关键路径；可选截止工期可行性，只读） |
+| `GET` | `/api/releases/{id}/diff?base_release_id=` | 比较两个批次**实际持久化的裁剪后图**：added / removed / changed（字段级 reasons）+ 沿目标批次依赖边向下游传递的 impacted_nodes，只读 |
 | `POST` | `/api/releases/{id}/report` | 节点成功 / 失败回报（跨版本、乱序返回 409；自动重试等待期返回 409 retry_not_due；未达上限返回 retry_scheduled，达上限失败回滚） |
 | `POST` | `/api/releases/{id}/retry` | 从断点续发 |
 | `GET` | `/health` | 健康检查 |
@@ -238,6 +268,27 @@ curl -s -X POST http://localhost:8000/api/releases \
 # targets=[] -> 422 empty_targets；targets=["c","c"] -> 422 duplicate_target
 # 不传 targets 或传 null -> 与旧版本一致的全量发布（targets=null, excluded_node_count=0）
 
+# 2d) 批次结构差异：以上一批次（<BASE_ID>）为基准比较新批次（<ID>）的裁剪后图
+curl -s 'http://localhost:8000/api/releases/<ID>/diff?base_release_id=<BASE_ID>'
+# -> 仅比较两批实际持久化的节点与依赖（裁剪掉的节点/边与运行时状态均不参与）：
+# {
+#   "release_id": "<ID>", "version": "2026.09.21-005",
+#   "base_release_id": "<BASE_ID>", "base_version": "2026.09.21-004",
+#   "added": ["svc-f"],                       # 新批次新增的节点
+#   "removed": ["svc-g"],                     # 基准批次有、新批次已不存在（仅在此单独报告）
+#   "changed": [
+#     {"name": "svc-a", "reasons": ["estimated_seconds", "max_attempts"]},
+#     {"name": "svc-c", "reasons": ["node_type", "metadata"]},
+#     {"name": "svc-d", "reasons": ["dependencies"]}
+#   ],
+#   "impacted_nodes": ["svc-a", "svc-c", "svc-d", "svc-f"],
+#   # added/changed 沿【目标批次】依赖边向下游传递的闭包（含起点）；
+#   # removed 的 svc-g 不做下游映射；各列表按节点名稳定排序
+#   "counts": {"added": 1, "removed": 1, "changed": 3, "impacted_nodes": 4},
+#   "comparison_scope": "persisted_pruned_graph"
+# }
+# 目标 / 基准批次缺失 -> 404 release_not_found；缺少 base_release_id -> 422；接口只读不改状态
+
 # 3) 回报 level0 成功（同层可并行/乱序回报）
 curl -s -X POST http://localhost:8000/api/releases/<ID>/report \
   -H 'Content-Type: application/json' \
@@ -311,7 +362,7 @@ curl -i -X POST http://localhost:8000/api/releases \
 │   ├── database.py    # SQLite 连接、建表、事务
 │   ├── models.py      # 请求模型
 │   ├── errors.py      # 业务异常
-│   └── service.py     # 拓扑分层 / 批次 / 回报 / 回滚 / 重试
+│   └── service.py     # 拓扑分层 / 批次 / 回报 / 回滚 / 重试 / 批次图差异与影响面
 ├── requirements.txt
 ├── smoke_test.py      # 端到端冒烟测试（pip install httpx 后 python3 smoke_test.py）
 ├── Dockerfile         # 构建期安装依赖
@@ -336,4 +387,7 @@ retry_delay_seconds=0 立即重试、手动 /retry 清零计数刷新额度、�
 targets 按目标裁剪诱导子图（传递前置闭包、共享前置去重、无关分支排除、levels 连续重编号）、
 裁剪批次的 plan/CPM/next_nodes/回报/回滚/重试不含已排除节点、裁剪改变关键路径分析、
 targets 空/重复/空白/类型校验、unknown_target 422 且整批零写入、裁剪前先校验整图（环/悬空边）、
-targets=null 全量发布、旧库补列（targets_json/excluded_node_count/is_target）且旧批次按全量兼容。
+targets=null 全量发布、旧库补列（targets_json/excluded_node_count/is_target）且旧批次按全量兼容、
+两批次裁剪后持久化图 diff：added/removed/changed 五类字段级 reasons 与固定排序、
+impacted_nodes 沿目标批次依赖边向下游传递（含起点、跨 seed 合并、removed 不映射）、
+裁剪批次比较不含未持久化节点、只读不改变批次状态、目标/基准缺失 404、缺少参数 422、空差异全空计数 0。

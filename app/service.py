@@ -466,6 +466,134 @@ def get_release(release_id: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# 批次结构差异与影响面（只读，比较实际持久化的裁剪后图）
+# --------------------------------------------------------------------------- #
+# changed 命中字段的固定展示顺序（稳定输出，与列表本身的名字排序相互独立）
+_DIFF_REASON_ORDER = [
+    "node_type",
+    "estimated_seconds",
+    "max_attempts",
+    "retry_delay_seconds",
+    "metadata",
+    "dependencies",
+]
+
+
+def _load_persisted_graph(conn, release_id: str) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """读取一个批次实际持久化的裁剪后图（节点 + 前置集合）。
+
+    仅读取结构性字段（节点类型、工期、重试配置、元数据、持久化依赖边），
+    不包含运行时回报状态；缺失批次抛 404 release_not_found。
+    """
+    r = dict(_get_release_row(conn, release_id))
+    node_rows = conn.execute(
+        "SELECT * FROM nodes WHERE release_id = ? ORDER BY name", (release_id,)
+    ).fetchall()
+
+    prereqs: dict[str, set[str]] = defaultdict(set)
+    for frm, to in conn.execute(
+        "SELECT from_node, to_node FROM edges WHERE release_id = ?", (release_id,)
+    ):
+        prereqs[to].add(frm)
+
+    graph: dict[str, dict[str, Any]] = {}
+    for row in node_rows:
+        n = dict(row)
+        graph[n["name"]] = {
+            "name": n["name"],
+            "node_type": n["node_type"],
+            "estimated_seconds": int(n["estimated_seconds"] or 0),
+            "max_attempts": int(n["max_attempts"] if n["max_attempts"] is not None else 1),
+            "retry_delay_seconds": int(n["retry_delay_seconds"] or 0),
+            "metadata": json.loads(n["metadata_json"]),
+            "dependencies": prereqs[n["name"]],
+        }
+    return r, graph
+
+
+def diff_releases(release_id: str, base_release_id: str) -> dict[str, Any]:
+    """比较目标批次相对基准批次的结构差异（base -> target）。
+
+    - added/removed：仅出现在一侧的持久化节点；
+    - changed：同名节点在节点类型、工期、重试配置（max_attempts /
+      retry_delay_seconds）、元数据或前置依赖集合任一不同即命中，
+      reasons 按固定字段顺序列出具体变化项；
+    - impacted_nodes：从 added/changed 节点出发，沿**目标批次**的持久化依赖边
+      向下游（后置方向）传递可达的全部节点（含触发起点本身），按名字排序；
+      removed 节点在目标批次中已不存在，不参与下游映射，单独在 removed 中报告。
+    全程只读，不改变任何批次状态。
+    """
+    with lock():
+        conn = get_conn()
+        base_row, base_graph = _load_persisted_graph(conn, base_release_id)
+        target_row, target_graph = _load_persisted_graph(conn, release_id)
+
+        base_names = set(base_graph)
+        target_names = set(target_graph)
+        added_names = target_names - base_names
+        removed_names = base_names - target_names
+        common_names = base_names & target_names
+
+        changed: list[dict[str, Any]] = []
+        seed_names: set[str] = set(added_names)
+        for name in sorted(common_names):
+            b, t = base_graph[name], target_graph[name]
+            reasons: list[str] = []
+            if t["node_type"] != b["node_type"]:
+                reasons.append("node_type")
+            if t["estimated_seconds"] != b["estimated_seconds"]:
+                reasons.append("estimated_seconds")
+            if t["max_attempts"] != b["max_attempts"]:
+                reasons.append("max_attempts")
+            if t["retry_delay_seconds"] != b["retry_delay_seconds"]:
+                reasons.append("retry_delay_seconds")
+            if t["metadata"] != b["metadata"]:
+                reasons.append("metadata")
+            if t["dependencies"] != b["dependencies"]:
+                reasons.append("dependencies")
+            if reasons:
+                changed.append({
+                    "name": name,
+                    "reasons": [r for r in _DIFF_REASON_ORDER if r in reasons],
+                })
+                seed_names.add(name)
+
+        # 目标批次的后置映射：from -> {to, ...}（只使用实际持久化的裁剪后图边）
+        successors: dict[str, set[str]] = defaultdict(set)
+        for node in target_graph.values():
+            for prereq in node["dependencies"]:
+                successors[prereq].add(node["name"])
+
+        # 沿目标批次依赖边向下游传递（BFS 闭包，起点本身计入影响面）
+        impacted: set[str] = set()
+        stack = [n for n in seed_names if n in target_names]
+        while stack:
+            cur = stack.pop()
+            if cur in impacted:
+                continue
+            impacted.add(cur)
+            stack.extend(successors[cur] - impacted)
+
+    return {
+        "release_id": target_row["id"],
+        "version": target_row["version"],
+        "base_release_id": base_row["id"],
+        "base_version": base_row["version"],
+        "added": sorted(added_names),
+        "removed": sorted(removed_names),
+        "changed": changed,  # 已按节点名字典序排列，reasons 按固定字段顺序排列
+        "impacted_nodes": sorted(impacted),
+        "counts": {
+            "added": len(added_names),
+            "removed": len(removed_names),
+            "changed": len(changed),
+            "impacted_nodes": len(impacted),
+        },
+        "comparison_scope": "persisted_pruned_graph",
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 节点回报
 # --------------------------------------------------------------------------- #
 def _record_event(conn, release_id: str, node: str, event_type: str,

@@ -65,6 +65,25 @@ def get_release_status(release_id: str) -> dict:
     return service.get_release(release_id)
 
 
+@app.get("/api/releases/{release_id}/diff", tags=["releases"])
+def diff_release(
+    release_id: str,
+    base_release_id: str = Query(
+        ..., min_length=1,
+        description="基准批次 ID；仅比较两个批次实际持久化的裁剪后图（结构字段，不含运行时状态）",
+    ),
+) -> dict:
+    """比较两个发布批次实际持久化的裁剪后图结构差异与影响面（只读）。
+
+    返回 added / removed / changed：changed 在节点类型、工期、重试配置
+    （max_attempts / retry_delay_seconds）、元数据或前置依赖集合任一变化时命中，
+    并按固定字段顺序列出 reasons。impacted_nodes 从 added/changed 节点出发，
+    沿目标批次依赖边向下游传递（含起点本身）；removed 单独报告，不映射到目标批次
+    中已不存在的节点。各列表按节点名稳定排序并给出计数。基准或目标批次缺失返回 404。
+    """
+    return service.diff_releases(release_id, base_release_id)
+
+
 @app.get("/api/releases/{release_id}/plan", tags=["releases"])
 def get_release_plan(
     release_id: str,

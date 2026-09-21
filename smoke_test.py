@@ -703,4 +703,176 @@ with TestClient(app) as legacy_client:
     assert r.json()["release"]["status"] == "failed"
 print("[OK] 旧批次 max_attempts 默认 1：首次失败即终态回滚，详情返回全部重试字段")
 
+# --- 22. 批次结构差异与影响面：比较实际持久化的裁剪后图（只读）---
+# 第 21 步把全局连接切到了 legacy.db，先切回主测试库
+config.DB_PATH = os.environ["DB_PATH"]
+database.init_db(os.environ["DB_PATH"])
+
+# 基准批次：a(10s)/b(5s,team=infra) -> c(3s) -> d(1s,region=cn)；e 独立；g 独立（将被移除）
+r = client.post("/api/releases", json={
+    "version": "v-diff-base",
+    "nodes": [
+        {"name": "a", "estimated_seconds": 10},
+        {"name": "b", "estimated_seconds": 5, "metadata": {"team": "infra"}},
+        {"name": "c", "estimated_seconds": 3},
+        {"name": "d", "estimated_seconds": 1, "metadata": {"region": "cn"}},
+        {"name": "e", "estimated_seconds": 2},
+        {"name": "g"},
+    ],
+    "dependencies": [
+        {"from_node": "a", "to_node": "c"},
+        {"from_node": "b", "to_node": "c"},
+        {"from_node": "c", "to_node": "d"},
+    ],
+})
+assert r.status_code == 201, r.text
+dbase = r.json()["id"]
+
+# 基准批次上制造运行时状态：e 回报成功（diff 不应受回报状态影响）
+assert client.post(f"/api/releases/{dbase}/report",
+                   json={"node": "e", "status": "success", "version": "v-diff-base"}
+                   ).status_code == 200
+
+# 目标批次：a 改工期+重试上限；b 改元数据；c 改类型；d 加重试延迟+新前置 f；f 新增；g 删除
+r = client.post("/api/releases", json={
+    "version": "v-diff-target",
+    "nodes": [
+        {"name": "a", "estimated_seconds": 20, "max_attempts": 3},
+        {"name": "b", "estimated_seconds": 5,
+         "metadata": {"team": "infra", "owner": "x"}},
+        {"name": "c", "estimated_seconds": 3, "node_type": "job"},
+        {"name": "d", "estimated_seconds": 1, "retry_delay_seconds": 30,
+         "metadata": {"region": "cn"}},
+        {"name": "e", "estimated_seconds": 2},
+        {"name": "f"},
+    ],
+    "dependencies": [
+        {"from_node": "a", "to_node": "c"},
+        {"from_node": "b", "to_node": "c"},
+        {"from_node": "c", "to_node": "d"},
+        {"from_node": "f", "to_node": "d"},
+    ],
+})
+assert r.status_code == 201, r.text
+dtarget = r.json()["id"]
+
+before_base = client.get(f"/api/releases/{dbase}").json()
+before_target = client.get(f"/api/releases/{dtarget}").json()
+
+r = client.get(f"/api/releases/{dtarget}/diff", params={"base_release_id": dbase})
+assert r.status_code == 200, r.text
+diff = r.json()
+assert diff["release_id"] == dtarget and diff["version"] == "v-diff-target"
+assert diff["base_release_id"] == dbase and diff["base_version"] == "v-diff-base"
+assert diff["comparison_scope"] == "persisted_pruned_graph"
+assert diff["added"] == ["f"]
+assert diff["removed"] == ["g"]
+changed_map = {item["name"]: item["reasons"] for item in diff["changed"]}
+assert list(changed_map) == ["a", "b", "c", "d"]  # changed 按节点名稳定排序
+assert changed_map["a"] == ["estimated_seconds", "max_attempts"]
+assert changed_map["b"] == ["metadata"]
+assert changed_map["c"] == ["node_type"]
+assert changed_map["d"] == ["retry_delay_seconds", "dependencies"]
+# impacted：seed={f(added), a/b/c/d(changed)} 沿目标批次边向下游闭包（含起点本身）
+# a->c->d, b->c->d, f->d；e 与任何 seed 无关，g 已 removed 不映射
+assert diff["impacted_nodes"] == ["a", "b", "c", "d", "f"], diff["impacted_nodes"]
+assert diff["counts"] == {"added": 1, "removed": 1, "changed": 4, "impacted_nodes": 5}
+print("[OK] diff：added/removed/changed 字段级 reasons 与 impacted 下游闭包（含起点、跨 seed 合并）")
+
+# 运行时回报状态不影响结构差异：e 在基准批次已 success，仍既不 changed 也不 impacted
+assert "e" not in changed_map and "e" not in diff["impacted_nodes"]
+# 只读：两批次状态 / 进度不变
+after_base = client.get(f"/api/releases/{dbase}").json()
+after_target = client.get(f"/api/releases/{dtarget}").json()
+assert after_base["status"] == before_base["status"] == "running"
+assert after_base["progress"] == before_base["progress"]
+assert after_target["status"] == before_target["status"] == "pending"
+assert after_target["progress"] == before_target["progress"]
+print("[OK] diff 忽略运行时状态且只读，不改变两批次状态 / 进度")
+
+# 反向比较：added/removed 对调；changed 对称命中；impacted 沿【基准批次】(此向的目标图) 边传递
+rev = client.get(f"/api/releases/{dbase}/diff", params={"base_release_id": dtarget}).json()
+assert rev["added"] == ["g"] and rev["removed"] == ["f"]
+assert {c["name"] for c in rev["changed"]} == {"a", "b", "c", "d"}
+# seed={g(added), a/b/c/d(changed)}：g 独立闭包仅自身；a/b/c/d 沿 a->c->d 向下游传递
+# removed 的 f 在 dbase 图中已不存在，不映射为 impacted
+assert rev["impacted_nodes"] == ["a", "b", "c", "d", "g"], rev["impacted_nodes"]
+assert rev["counts"] == {"added": 1, "removed": 1, "changed": 4, "impacted_nodes": 5}
+print("[OK] diff 方向性正确：反向 added/removed 对调，impacted 沿当前目标图传递，removed 不映射")
+
+# 比较的是裁剪【后】持久化图：同一组提交节点，targets 不同
+r = client.post("/api/releases", json={
+    "version": "v-diff-prune-base",
+    "nodes": [{"name": "p"}, {"name": "q"}, {"name": "r"}, {"name": "s"}],
+    "dependencies": [
+        {"from_node": "p", "to_node": "r"},
+        {"from_node": "q", "to_node": "r"},
+        {"from_node": "r", "to_node": "s"},
+    ],
+    "targets": ["r"],
+})
+dpb = r.json()["id"]
+assert {n["name"] for n in r.json()["nodes"]} == {"p", "q", "r"}
+r = client.post("/api/releases", json={
+    "version": "v-diff-prune-target",
+    "nodes": [{"name": "p"}, {"name": "q"}, {"name": "r"}, {"name": "s"}],
+    "dependencies": [
+        {"from_node": "p", "to_node": "r"},
+        {"from_node": "q", "to_node": "r"},
+        {"from_node": "r", "to_node": "s"},
+    ],
+    "targets": ["s"],
+})
+dpt = r.json()["id"]
+pdiff = client.get(f"/api/releases/{dpt}/diff", params={"base_release_id": dpb}).json()
+assert pdiff["added"] == ["s"] and pdiff["removed"] == [] and pdiff["changed"] == []
+assert pdiff["impacted_nodes"] == ["s"]  # 新增 s 无下游，闭包仅自身
+assert pdiff["counts"] == {"added": 1, "removed": 0, "changed": 0, "impacted_nodes": 1}
+pdiff_rev = client.get(f"/api/releases/{dpb}/diff", params={"base_release_id": dpt}).json()
+assert pdiff_rev["added"] == [] and pdiff_rev["removed"] == ["s"]
+assert pdiff_rev["impacted_nodes"] == []
+print("[OK] diff 仅基于持久化裁剪子图：targets 差异体现为 added/removed，未入库节点不出现")
+
+# 完全相同的图（含元数据 key 顺序不同、依赖边顺序 / 重复不同）-> 空差异
+r = client.post("/api/releases", json={
+    "version": "v-diff-eq1",
+    "nodes": [
+        {"name": "a", "metadata": {"z": 1, "a": 2}},
+        {"name": "b"}, {"name": "c"},
+    ],
+    "dependencies": [
+        {"from_node": "a", "to_node": "c"},
+        {"from_node": "a", "to_node": "c"},  # 重复边入库前去重
+        {"from_node": "b", "to_node": "c"},
+    ],
+})
+deq1 = r.json()["id"]
+r = client.post("/api/releases", json={
+    "version": "v-diff-eq2",
+    "nodes": [
+        {"name": "a", "metadata": {"a": 2, "z": 1}},  # JSON 语义相同，key 顺序不同
+        {"name": "b"}, {"name": "c"},
+    ],
+    "dependencies": [
+        {"from_node": "b", "to_node": "c"},  # 边顺序不同、无重复
+        {"from_node": "a", "to_node": "c"},
+    ],
+})
+deq2 = r.json()["id"]
+eq = client.get(f"/api/releases/{deq2}/diff", params={"base_release_id": deq1}).json()
+assert eq["added"] == [] and eq["removed"] == [] and eq["changed"] == []
+assert eq["impacted_nodes"] == []
+assert eq["counts"] == {"added": 0, "removed": 0, "changed": 0, "impacted_nodes": 0}
+print("[OK] 相同图空差异：元数据按 JSON 语义比较，依赖边按集合比较（顺序 / 重复不敏感）")
+
+# 404 / 422
+assert client.get(f"/api/releases/ghost/diff",
+                  params={"base_release_id": dbase}).status_code == 404
+r = client.get(f"/api/releases/{dtarget}/diff", params={"base_release_id": "ghost"})
+assert r.status_code == 404 and r.json()["error"]["code"] == "release_not_found"
+assert client.get(f"/api/releases/{dtarget}/diff").status_code == 422  # 缺 base_release_id
+assert client.get(f"/api/releases/{dtarget}/diff",
+                  params={"base_release_id": ""}).status_code == 422
+print("[OK] diff：目标 / 基准缺失 404 release_not_found，缺少 / 空参数 422")
+
 print("\n全部测试通过 ✔")
